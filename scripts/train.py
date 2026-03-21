@@ -238,6 +238,8 @@ def build_selfplay_panel(
     buffer_cap: int,
     last_game_time: float,
     outcomes: dict,
+    status: str = "",
+    games_per_sec: float = 0.0,
 ) -> Panel:
     fill_pct = buffer_size / max(buffer_cap, 1) * 100
     bar_w = 20
@@ -249,12 +251,22 @@ def build_selfplay_panel(
     d = outcomes.get("draw", 0)
     total_games_out = w + b + d or 1
 
-    lines = [
+    lines = []
+    if status:
+        lines.append(f"  [bold yellow]{status}[/]")
+        lines.append("")
+
+    lines += [
         f"  Games played      [bold]{games_total:,}[/]",
         f"  Positions total   [bold]{positions_total:,}[/]",
         f"  Buffer            {buf_bar} {fill_pct:.0f}%",
         f"  ({buffer_size:,}/{buffer_cap:,})",
-        f"  Last batch time   {last_game_time:.1f}s",
+    ]
+    if games_per_sec > 0:
+        lines.append(f"  Speed             [bold]{games_per_sec:.1f}[/] games/s")
+    if last_game_time > 0:
+        lines.append(f"  Last batch time   {last_game_time:.1f}s")
+    lines += [
         "",
         f"  Outcomes  [bright_white]W {w}[/] | [dim]D {d}[/] | [bright_red]L {b}[/]"
         f"  ({w / total_games_out * 100:.0f}% / {d / total_games_out * 100:.0f}% / {b / total_games_out * 100:.0f}%)",
@@ -296,12 +308,13 @@ def generate_random_positions(num_positions: int, replay_buffer: ReplayBuffer):
         replay_buffer.add(features, policy, value)
 
 
-def selfplay_with_rust(config, weights_path: Path, num_games: int):
+def selfplay_batch(config, weights_path: Path, batch_size: int):
+    """Run a small batch of self-play games. Returns positions or None if engine unavailable."""
     try:
         import chess_engine_py as engine
         data = engine.run_selfplay(
             str(weights_path),
-            num_games=num_games,
+            num_games=batch_size,
             simulations=config.engine.mcts_simulations,
             c_puct=config.engine.c_puct,
             dirichlet_alpha=config.engine.dirichlet_alpha,
@@ -356,6 +369,8 @@ def main():
         buffer_cap=config.training.replay_buffer_size,
         last_game_time=0.0,
         outcomes={"white": 0, "black": 0, "draw": 0},
+        status="",
+        games_per_sec=0.0,
     )
 
     console.print()
@@ -371,28 +386,36 @@ def main():
             # ── Self-play ──
             if not args.train_only:
                 weights_path = weights_dir / f"weights_{cycle:04d}.bin"
+                sp_stats["status"] = "Exporting weights..."
+                live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
                 export_weights(model, weights_path, fuse_batchnorm=True)
 
+                total_games = config.training.selfplay_games_per_cycle
+                sp_batch = max(1, min(8, total_games // 4))  # small batches for progress
+                games_done = 0
                 sp_t0 = time.time()
-                if args.random_data:
-                    n_pos = config.training.selfplay_games_per_cycle * 80
-                    generate_random_positions(n_pos, replay_buffer)
-                    sp_stats["games_total"] += config.training.selfplay_games_per_cycle
-                    sp_stats["positions_total"] += n_pos
-                else:
-                    positions = selfplay_with_rust(
-                        config, weights_path, config.training.selfplay_games_per_cycle
+                use_engine = not args.random_data
+
+                while games_done < total_games:
+                    batch_n = min(sp_batch, total_games - games_done)
+                    elapsed = time.time() - sp_t0
+                    gps = games_done / elapsed if elapsed > 0.1 else 0.0
+                    sp_stats["status"] = (
+                        f"Self-play: {games_done}/{total_games} games"
+                        f" ({gps:.1f} g/s)" if gps > 0 else
+                        f"Self-play: {games_done}/{total_games} games"
                     )
-                    if positions is None:
-                        n_pos = config.training.selfplay_games_per_cycle * 80
-                        generate_random_positions(n_pos, replay_buffer)
-                        sp_stats["games_total"] += config.training.selfplay_games_per_cycle
-                        sp_stats["positions_total"] += n_pos
-                    else:
+                    sp_stats["games_per_sec"] = gps
+                    live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
+
+                    if use_engine:
+                        positions = selfplay_batch(config, weights_path, batch_n)
+                        if positions is None:
+                            # Engine not available, fall back to random
+                            use_engine = False
+                            continue
                         replay_buffer.add_batch(positions)
-                        sp_stats["games_total"] += config.training.selfplay_games_per_cycle
                         sp_stats["positions_total"] += len(positions)
-                        # Count outcomes from values
                         for _, _, v in positions:
                             if v > 0.5:
                                 sp_stats["outcomes"]["white"] += 1
@@ -400,9 +423,18 @@ def main():
                                 sp_stats["outcomes"]["black"] += 1
                             else:
                                 sp_stats["outcomes"]["draw"] += 1
+                    else:
+                        n_pos = batch_n * 80
+                        generate_random_positions(n_pos, replay_buffer)
+                        sp_stats["positions_total"] += n_pos
+
+                    games_done += batch_n
+                    sp_stats["games_total"] += batch_n
 
                 sp_stats["last_game_time"] = time.time() - sp_t0
                 sp_stats["buffer_size"] = len(replay_buffer)
+                sp_stats["games_per_sec"] = total_games / max(time.time() - sp_t0, 0.01)
+                sp_stats["status"] = ""
 
             if args.selfplay_only:
                 live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
@@ -413,10 +445,13 @@ def main():
 
             # ── Training ──
             steps_per_cycle = config.training.training_steps // config.training.cycles
+            sp_stats["status"] = f"Training: 0/{steps_per_cycle} steps"
+            live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
 
             def on_step(step_i, metrics):
                 hist.record(metrics)
-                if step_i % 5 == 0:  # Update dashboard every 5 steps
+                if step_i % 5 == 0:
+                    sp_stats["status"] = f"Training: {step_i + 1}/{steps_per_cycle} steps"
                     sp_stats["buffer_size"] = len(replay_buffer)
                     live.update(build_dashboard(
                         config, param_count, cycle + 1, hist, trainer, sp_stats
@@ -424,7 +459,7 @@ def main():
 
             trainer.train_epoch(replay_buffer, steps_per_cycle, step_callback=on_step)
 
-            # Final dashboard update for this cycle
+            sp_stats["status"] = ""
             live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
 
             # Checkpoint
