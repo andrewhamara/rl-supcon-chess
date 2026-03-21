@@ -128,6 +128,8 @@ pub fn conv3x3_int8_neon(
 ) {
     assert_eq!(kernel.len(), in_channels * 9);
     let hw = height * width;
+    let total_elems = in_channels * 9;
+    let mut gather_buf = vec![0i8; total_elems];
 
     // For each output position
     for oh in 0..height {
@@ -137,9 +139,6 @@ pub fn conv3x3_int8_neon(
                 let mut elem_idx = 0;
 
                 // Gather input patch * kernel for all input channels
-                // We accumulate in groups of 16 int8 elements
-                let mut gather_buf = [0i8; 1024]; // max in_c * 9
-                let total_elems = in_channels * 9;
 
                 for ic in 0..in_channels {
                     for kh in 0..3usize {
