@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "chess-engine-py"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "pydantic>=2.0",
+    "tomli>=2.0",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "chess_engine_py"

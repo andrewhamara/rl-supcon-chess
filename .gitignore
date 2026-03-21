@@ -1,0 +1,27 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+*.whl
+
+# Training outputs
+/output/
+/checkpoints/
+*.bin
+*.pt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

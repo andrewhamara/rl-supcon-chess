@@ -1,0 +1,14 @@
+[package]
+name = "chess-engine-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "chess_engine_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+chess-engine = { path = "../engine" }
+cozy-chess = "0.3"
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
