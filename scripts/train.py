@@ -240,7 +240,12 @@ def main():
     checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
 
-    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     model = ChessNet.from_config(config.network)
     param_count = sum(p.numel() for p in model.parameters())
     trainer = Trainer(config, model, device)

@@ -55,6 +55,19 @@ class Trainer:
             beta_end=config.supcon.schedule.beta_end,
         )
 
+        # AMP — use bf16 on CUDA if available, skip on MPS/CPU
+        self.use_amp = self.device.type == "cuda"
+        if self.use_amp:
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            self.scaler = torch.amp.GradScaler("cuda", enabled=(self.amp_dtype == torch.float16))
+        else:
+            self.amp_dtype = torch.float32
+            self.scaler = torch.amp.GradScaler("cpu", enabled=False)
+
+        # torch.compile for PyTorch 2.x (CUDA only — inductor backend)
+        if self.device.type == "cuda" and hasattr(torch, "compile"):
+            self.model = torch.compile(self.model)
+
         self.global_step = 0
 
     def train_step(
@@ -76,56 +89,49 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad()
 
-        # Forward pass
-        policy_logits, value_pred, value_embedding, supcon_proj = self.model(features)
+        with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+            # Forward pass
+            policy_logits, value_pred, _, supcon_proj = self.model(features)
 
-        # --- RL losses ---
-        # Policy: cross-entropy with MCTS visit distribution
-        log_probs = F.log_softmax(policy_logits, dim=1)
-        policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
+            # --- RL losses ---
+            log_probs = F.log_softmax(policy_logits, dim=1)
+            policy_loss = -(policy_target * log_probs).sum(dim=1).mean()
+            value_loss = F.mse_loss(value_pred.squeeze(-1), value_target)
 
-        # Value: MSE
-        value_loss = F.mse_loss(value_pred.squeeze(-1), value_target)
-
-        rl_loss = (
-            self.config.training.loss.policy_weight * policy_loss
-            + self.config.training.loss.value_weight * value_loss
-        )
-
-        # --- SupCon loss ---
-        supcon_loss = torch.tensor(0.0, device=self.device)
-
-        if self.config.supcon.enabled:
-            # Discretize value targets into bins
-            value_bins = discretize_value(
-                value_target,
-                num_bins=self.config.supcon.num_bins,
-                strategy=self.config.supcon.bin_strategy,
+            rl_loss = (
+                self.config.training.loss.policy_weight * policy_loss
+                + self.config.training.loss.value_weight * value_loss
             )
 
-            # Filter out bins with too few samples
-            valid_mask = filter_small_bins(value_bins, self.config.supcon.min_bin_size)
+            # --- SupCon loss ---
+            supcon_loss = torch.tensor(0.0, device=self.device)
 
-            if valid_mask.sum() >= 2 * self.config.supcon.min_bin_size:
-                valid_proj = supcon_proj[valid_mask]
-                valid_bins = value_bins[valid_mask]
-
-                # Create two views for SupCon
-                supcon_features = prepare_supcon_features(
-                    valid_proj, noise_std=self.config.supcon.noise_std
+            if self.config.supcon.enabled:
+                value_bins = discretize_value(
+                    value_target,
+                    num_bins=self.config.supcon.num_bins,
+                    strategy=self.config.supcon.bin_strategy,
                 )
+                valid_mask = filter_small_bins(value_bins, self.config.supcon.min_bin_size)
 
-                supcon_loss = self.supcon_criterion(supcon_features, labels=valid_bins)
+                if valid_mask.sum() >= 2 * self.config.supcon.min_bin_size:
+                    valid_proj = supcon_proj[valid_mask].float()  # SupCon needs fp32
+                    valid_bins = value_bins[valid_mask]
+                    supcon_features = prepare_supcon_features(
+                        valid_proj, noise_std=self.config.supcon.noise_std
+                    )
+                    supcon_loss = self.supcon_criterion(supcon_features, labels=valid_bins)
 
-        # --- Hybrid loss ---
-        alpha, beta = self.schedule.get_weights(self.global_step)
-        total_loss = alpha * rl_loss + beta * supcon_loss
+            # --- Hybrid loss ---
+            alpha, beta = self.schedule.get_weights(self.global_step)
+            total_loss = alpha * rl_loss + beta * supcon_loss
 
-        # Backward pass
-        total_loss.backward()
-        # Gradient clipping
+        # Backward pass (scaler is no-op for bf16 or CPU)
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.lr_scheduler.step()
 
         self.global_step += 1
@@ -164,9 +170,17 @@ class Trainer:
         for step_i in range(steps_per_epoch):
             features_np, policy_np, value_np = replay_buffer.sample(batch_size)
 
-            features = torch.from_numpy(features_np).float().to(self.device)
-            policy_target = torch.from_numpy(policy_np).float().to(self.device)
-            value_target = torch.from_numpy(value_np).float().to(self.device)
+            features = torch.from_numpy(features_np).float()
+            policy_target = torch.from_numpy(policy_np).float()
+            value_target = torch.from_numpy(value_np).float()
+            if self.device.type == "cuda":
+                features = features.pin_memory().to(self.device, non_blocking=True)
+                policy_target = policy_target.pin_memory().to(self.device, non_blocking=True)
+                value_target = value_target.pin_memory().to(self.device, non_blocking=True)
+            else:
+                features = features.to(self.device)
+                policy_target = policy_target.to(self.device)
+                value_target = value_target.to(self.device)
 
             metrics = self.train_step(features, policy_target, value_target)
 
