@@ -23,6 +23,7 @@ from training.model import ChessNet
 from training.data import ReplayBuffer, deserialize_positions
 from training.trainer import Trainer
 from training.export import export_weights
+from training.selfplay_gpu import gpu_selfplay
 
 console = Console()
 
@@ -336,6 +337,7 @@ def main():
     parser.add_argument("--selfplay-only", action="store_true")
     parser.add_argument("--train-only", action="store_true")
     parser.add_argument("--random-data", action="store_true", help="Use random data (for pipeline testing)")
+    parser.add_argument("--cpu-selfplay", action="store_true", help="Force CPU self-play via Rust engine")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -352,6 +354,9 @@ def main():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    # Use GPU self-play when a GPU is available (unless forced to CPU)
+    use_gpu_selfplay = device.type in ("cuda", "mps") and not args.cpu_selfplay
+
     model = ChessNet.from_config(config.network)
     param_count = sum(p.numel() for p in model.parameters())
     trainer = Trainer(config, model, device)
@@ -374,10 +379,15 @@ def main():
         games_per_sec=0.0,
     )
 
+    sp_mode = "GPU batched" if use_gpu_selfplay else "CPU (Rust)"
+    if args.random_data:
+        sp_mode = "random (testing)"
+
     console.print()
     console.print("[bold bright_cyan]  AlphaZero + SupCon Chess Engine Trainer[/]")
     console.print(f"  Model: {config.network.num_blocks}x{config.network.num_filters} "
                   f"({param_count:,} params) | Device: {device}")
+    console.print(f"  Self-play: {sp_mode} | Sims: {config.engine.mcts_simulations}")
     if args.checkpoint:
         console.print(f"  Resumed from step {trainer.global_step:,}")
     console.print()
@@ -386,53 +396,91 @@ def main():
         for cycle in range(config.training.cycles):
             # ── Self-play ──
             if not args.train_only:
-                weights_path = weights_dir / f"weights_{cycle:04d}.bin"
-                sp_stats["status"] = "Exporting weights..."
-                live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
-                export_weights(model, weights_path, fuse_batchnorm=True)
-
                 total_games = config.training.selfplay_games_per_cycle
-                # Each batch runs all games in parallel via rayon; split into
-                # a few batches so the dashboard can update between them.
-                sp_batch = max(1, total_games // 4)
-                games_done = 0
                 sp_t0 = time.time()
-                use_engine = not args.random_data
 
-                while games_done < total_games:
-                    batch_n = min(sp_batch, total_games - games_done)
-                    elapsed = time.time() - sp_t0
-                    gps = games_done / elapsed if elapsed > 0.1 else 0.0
-                    sp_stats["status"] = (
-                        f"Self-play: {games_done}/{total_games} games"
-                        f" ({gps:.1f} g/s)" if gps > 0 else
-                        f"Self-play: {games_done}/{total_games} games"
-                    )
-                    sp_stats["games_per_sec"] = gps
+                if args.random_data:
+                    sp_stats["status"] = f"Generating {total_games * 80} random positions..."
+                    live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
+                    n_pos = total_games * 80
+                    generate_random_positions(n_pos, replay_buffer)
+                    sp_stats["games_total"] += total_games
+                    sp_stats["positions_total"] += n_pos
+                elif use_gpu_selfplay:
+                    # GPU self-play: batched inference across all games
+                    def sp_callback(completed, total):
+                        elapsed = time.time() - sp_t0
+                        gps = completed / elapsed if elapsed > 0.1 else 0.0
+                        sp_stats["status"] = (
+                            f"Self-play (GPU): {completed}/{total} games"
+                            + (f" ({gps:.1f} g/s)" if gps > 0 else "")
+                        )
+                        sp_stats["games_per_sec"] = gps
+                        live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
+
+                    sp_stats["status"] = f"Self-play (GPU): starting {total_games} games..."
                     live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
 
-                    if use_engine:
+                    positions = gpu_selfplay(
+                        trainer.model, device, total_games,
+                        num_simulations=config.engine.mcts_simulations,
+                        c_puct=config.engine.c_puct,
+                        dirichlet_alpha=config.engine.dirichlet_alpha,
+                        dirichlet_epsilon=config.engine.dirichlet_epsilon,
+                        temperature=config.engine.temperature,
+                        temp_threshold=config.engine.temperature_threshold_move,
+                        callback=sp_callback,
+                    )
+                    for features, policy, value in positions:
+                        replay_buffer.add(features, policy, value)
+                    sp_stats["games_total"] += total_games
+                    sp_stats["positions_total"] += len(positions)
+                    for _, _, v in positions:
+                        if v > 0.5:
+                            sp_stats["outcomes"]["white"] += 1
+                        elif v < -0.5:
+                            sp_stats["outcomes"]["black"] += 1
+                        else:
+                            sp_stats["outcomes"]["draw"] += 1
+                else:
+                    # CPU self-play via Rust engine
+                    weights_path = weights_dir / f"weights_{cycle:04d}.bin"
+                    sp_stats["status"] = "Exporting weights..."
+                    live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
+                    export_weights(model, weights_path, fuse_batchnorm=True)
+
+                    sp_batch = max(1, total_games // 4)
+                    games_done = 0
+
+                    while games_done < total_games:
+                        batch_n = min(sp_batch, total_games - games_done)
+                        elapsed = time.time() - sp_t0
+                        gps = games_done / elapsed if elapsed > 0.1 else 0.0
+                        sp_stats["status"] = (
+                            f"Self-play (CPU): {games_done}/{total_games} games"
+                            + (f" ({gps:.1f} g/s)" if gps > 0 else "")
+                        )
+                        sp_stats["games_per_sec"] = gps
+                        live.update(build_dashboard(config, param_count, cycle + 1, hist, trainer, sp_stats))
+
                         positions = selfplay_batch(config, weights_path, batch_n)
                         if positions is None:
-                            # Engine not available, fall back to random
-                            use_engine = False
-                            continue
-                        replay_buffer.add_batch(positions)
-                        sp_stats["positions_total"] += len(positions)
-                        for _, _, v in positions:
-                            if v > 0.5:
-                                sp_stats["outcomes"]["white"] += 1
-                            elif v < -0.5:
-                                sp_stats["outcomes"]["black"] += 1
-                            else:
-                                sp_stats["outcomes"]["draw"] += 1
-                    else:
-                        n_pos = batch_n * 80
-                        generate_random_positions(n_pos, replay_buffer)
-                        sp_stats["positions_total"] += n_pos
+                            n_pos = batch_n * 80
+                            generate_random_positions(n_pos, replay_buffer)
+                            sp_stats["positions_total"] += n_pos
+                        else:
+                            replay_buffer.add_batch(positions)
+                            sp_stats["positions_total"] += len(positions)
+                            for _, _, v in positions:
+                                if v > 0.5:
+                                    sp_stats["outcomes"]["white"] += 1
+                                elif v < -0.5:
+                                    sp_stats["outcomes"]["black"] += 1
+                                else:
+                                    sp_stats["outcomes"]["draw"] += 1
 
-                    games_done += batch_n
-                    sp_stats["games_total"] += batch_n
+                        games_done += batch_n
+                        sp_stats["games_total"] += batch_n
 
                 sp_stats["last_game_time"] = time.time() - sp_t0
                 sp_stats["buffer_size"] = len(replay_buffer)

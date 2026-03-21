@@ -16,9 +16,9 @@ class HybridSchedule:
         total_steps: int,
         phase1_end: float = 0.2,
         phase2_end: float = 0.7,
-        alpha_start: float = 0.95,
+        alpha_start: float = 0.99,
         alpha_end: float = 0.3,
-        beta_start: float = 0.05,
+        beta_start: float = 0.01,
         beta_end: float = 0.7,
     ):
         self.total_steps = total_steps
