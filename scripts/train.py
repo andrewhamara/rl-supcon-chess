@@ -2,7 +2,6 @@
 """Main training script: self-play + training loop with live dashboard."""
 
 import argparse
-import math
 import sys
 import time
 from collections import deque
@@ -17,9 +16,7 @@ from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
-from rich.text import Text
 
 from training.config import load_config
 from training.model import ChessNet
@@ -30,17 +27,102 @@ from training.export import export_weights
 console = Console()
 
 
-# ── Sparkline helper ──────────────────────────────────────────────────
-def sparkline(values: list[float], width: int = 40) -> str:
-    """Render a list of floats as a unicode sparkline."""
+# ── Chart helpers ────────────────────────────────────────────────────
+def _ema(values: list[float], alpha: float = 0.15) -> list[float]:
+    """Exponential moving average for smoothing."""
     if not values:
-        return ""
-    blocks = " ▁▂▃▄▅▆▇█"
-    lo, hi = min(values), max(values)
-    rng = hi - lo if hi - lo > 1e-8 else 1.0
-    # Take last `width` values
+        return []
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(alpha * v + (1 - alpha) * out[-1])
+    return out
+
+
+def mini_chart(
+    values: list[float],
+    width: int = 50,
+    height: int = 7,
+    color: str = "bright_white",
+    show_smooth: bool = True,
+) -> str:
+    """Render a multi-row braille-style area chart with optional EMA overlay.
+
+    Returns a string of `height` lines, each `width` characters wide.
+    Y-axis labels on the left, latest value + delta on the right.
+    """
+    if len(values) < 2:
+        return "\n".join([" " * (width + 16)] * height)
+
+    # Take the last `width` data points
     tail = values[-width:]
-    return "".join(blocks[min(8, int((v - lo) / rng * 8))] for v in tail)
+    smooth = _ema(tail, alpha=0.12) if show_smooth else tail
+
+    lo = min(min(tail), min(smooth))
+    hi = max(max(tail), max(smooth))
+    rng = hi - lo if hi - lo > 1e-9 else 1.0
+    # Pad range slightly so points aren't clipped at edges
+    lo -= rng * 0.05
+    hi += rng * 0.05
+    rng = hi - lo
+
+    # Braille block characters for the area fill (bottom to top density)
+    fill_chars = " ░▒▓█"
+
+    rows: list[str] = []
+    for row in range(height):
+        # Row 0 = top of chart, row height-1 = bottom
+        row_top = hi - (row / height) * rng
+        row_bot = hi - ((row + 1) / height) * rng
+
+        # Y-axis label: show on top, middle, bottom rows
+        if row == 0:
+            y_label = f"{hi:>7.3f} │"
+        elif row == height - 1:
+            y_label = f"{lo:>7.3f} │"
+        elif row == height // 2:
+            mid = (hi + lo) / 2
+            y_label = f"{mid:>7.3f} │"
+        else:
+            y_label = "        │"
+
+        line = ""
+        for i, (raw_v, sm_v) in enumerate(zip(tail, smooth)):
+            # How much of this cell is filled by the raw value
+            if raw_v >= row_top:
+                fill = 4  # full
+            elif raw_v <= row_bot:
+                fill = 0  # empty
+            else:
+                fill = int(((raw_v - row_bot) / (row_top - row_bot)) * 4)
+                fill = max(0, min(4, fill))
+
+            # Check if the smooth line passes through this cell
+            is_smooth = row_bot <= sm_v <= row_top
+
+            if is_smooth and show_smooth:
+                line += "─"
+            else:
+                line += fill_chars[fill]
+
+        # Pad if tail < width
+        line += " " * (width - len(tail))
+
+        # Right-side annotation on specific rows
+        if row == 0:
+            annotation = f"  [{color}]{tail[-1]:>8.4f}[/] now"
+        elif row == 1 and len(values) > 10:
+            delta = tail[-1] - tail[0]
+            arrow = "↓" if delta < 0 else "↑" if delta > 0 else "→"
+            d_color = "green" if delta < 0 else "red" if delta > 0 else "dim"
+            annotation = f"  [{d_color}]{arrow} {abs(delta):.4f}[/]"
+        elif row == 2:
+            annotation = f"  [green]{min(tail):>8.4f}[/] min"
+        else:
+            annotation = ""
+
+        rows.append(f"[dim]{y_label}[/][{color}]{line}[/]{annotation}")
+
+    return "\n".join(rows)
 
 
 def phase_label(alpha: float, beta: float) -> tuple[str, str]:
@@ -89,31 +171,40 @@ def build_header(config, param_count: int, cycle: int, total_cycles: int) -> Pan
     return Panel(grid, border_style="bright_cyan")
 
 
-def build_loss_panel(hist: MetricsHistory) -> Panel:
-    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
-    table.add_column("Loss", style="bold", width=8)
-    table.add_column("Current", justify="right", width=9)
-    table.add_column("Min", justify="right", width=9, style="green")
-    table.add_column("Trend (last 40 steps)", width=42)
+def build_loss_panels(hist: MetricsHistory) -> Layout:
+    """Build a 2x2 grid of loss charts, each with its own Y-scale."""
+    charts = Layout()
+    charts.split_column(
+        Layout(name="top_row", size=12),
+        Layout(name="bot_row", size=12),
+    )
+    charts["top_row"].split_row(
+        Layout(name="total"),
+        Layout(name="policy"),
+    )
+    charts["bot_row"].split_row(
+        Layout(name="value"),
+        Layout(name="supcon"),
+    )
 
-    for name, series, color in [
-        ("Total", hist.total, "bright_white"),
-        ("Policy", hist.policy, "bright_blue"),
-        ("Value", hist.value, "bright_green"),
-        ("SupCon", hist.supcon, "bright_magenta"),
+    for name, series, color, slot in [
+        ("Total Loss", hist.total, "bright_white", "total"),
+        ("Policy Loss", hist.policy, "bright_blue", "policy"),
+        ("Value Loss", hist.value, "bright_green", "value"),
+        ("SupCon Loss", hist.supcon, "bright_magenta", "supcon"),
     ]:
         vals = list(series)
-        cur = f"{vals[-1]:.4f}" if vals else "—"
-        mn = f"{min(vals):.4f}" if vals else "—"
-        spark = sparkline(vals)
-        table.add_row(
-            f"[{color}]{name}[/]",
-            f"[{color}]{cur}[/]",
-            mn,
-            f"[{color}]{spark}[/]",
-        )
+        chart_str = mini_chart(vals, width=45, height=8, color=color)
+        border = {"bright_white": "white", "bright_blue": "blue",
+                  "bright_green": "green", "bright_magenta": "magenta"}[color]
+        charts[slot].update(Panel(
+            chart_str,
+            title=f"[bold {color}]{name}[/]",
+            border_style=border,
+            padding=(0, 1),
+        ))
 
-    return Panel(table, title="[bold]Loss Curves[/]", border_style="blue")
+    return charts
 
 
 def build_schedule_panel(hist: MetricsHistory, global_step: int, total_steps: int) -> Panel:
@@ -177,21 +268,22 @@ def build_dashboard(
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="body"),
+        Layout(name="body", size=24),
+        Layout(name="footer", size=14),
     )
-    layout["body"].split_row(
-        Layout(name="left", ratio=3),
-        Layout(name="right", ratio=2),
-    )
-    layout["left"].split_column(
-        Layout(name="losses"),
-        Layout(name="schedule", size=12),
+    # Body: 2x2 loss charts
+    layout["body"].update(build_loss_panels(hist))
+    # Footer: schedule + self-play side by side
+    layout["footer"].split_row(
+        Layout(name="schedule", ratio=3),
+        Layout(name="selfplay", ratio=2),
     )
 
     layout["header"].update(build_header(config, param_count, cycle, config.training.cycles))
-    layout["losses"].update(build_loss_panel(hist))
-    layout["schedule"].update(build_schedule_panel(hist, trainer.global_step, config.training.training_steps))
-    layout["right"].update(build_selfplay_panel(**sp_stats))
+    layout["footer"]["schedule"].update(
+        build_schedule_panel(hist, trainer.global_step, config.training.training_steps)
+    )
+    layout["footer"]["selfplay"].update(build_selfplay_panel(**sp_stats))
     return layout
 
 
