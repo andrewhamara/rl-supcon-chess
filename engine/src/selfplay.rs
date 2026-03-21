@@ -1,4 +1,5 @@
 use cozy_chess::Board;
+use rayon::prelude::*;
 
 use crate::board;
 use crate::mcts::search::{MctsConfig, MctsSearch};
@@ -108,13 +109,14 @@ pub fn play_game(config: &MctsConfig, evaluator: &dyn NnEvaluator) -> GameResult
     }
 }
 
-/// Generate multiple self-play games.
+/// Generate multiple self-play games in parallel across all CPU cores.
 pub fn generate_games(
     num_games: usize,
     config: &MctsConfig,
     evaluator: &dyn NnEvaluator,
 ) -> Vec<GameResult> {
     (0..num_games)
+        .into_par_iter()
         .map(|_| play_game(config, evaluator))
         .collect()
 }

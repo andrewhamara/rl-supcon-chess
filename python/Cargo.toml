@@ -12,3 +12,4 @@ chess-engine = { path = "../engine" }
 cozy-chess = "0.3"
 pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"
+rayon = "1.10"

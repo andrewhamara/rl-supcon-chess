@@ -6,6 +6,7 @@ use chess_engine::nn::inference::{NnEvaluator, RandomEvaluator};
 use chess_engine::nn::weights::NetworkWeights;
 use chess_engine::nn::simd::Int8Evaluator;
 use chess_engine::selfplay;
+use rayon::ThreadPoolBuilder;
 
 /// Python bindings for the chess engine.
 #[pymodule]
@@ -36,10 +37,11 @@ fn load_evaluator(weights_path: &str) -> Box<dyn NnEvaluator> {
 }
 
 /// Run self-play games using the neural network weights from a file.
-/// Uses int8 quantized inference for speed.
+/// Uses int8 quantized inference for speed. Games run in parallel across `num_threads` cores.
 #[pyfunction]
 #[pyo3(signature = (weights_path, num_games=10, simulations=800, c_puct=2.5,
-                     dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature=1.0))]
+                     dirichlet_alpha=0.3, dirichlet_epsilon=0.25, temperature=1.0,
+                     num_threads=0))]
 fn run_selfplay(
     py: Python<'_>,
     weights_path: &str,
@@ -49,6 +51,7 @@ fn run_selfplay(
     dirichlet_alpha: f32,
     dirichlet_epsilon: f32,
     temperature: f32,
+    num_threads: usize,
 ) -> PyResult<Py<PyBytes>> {
     let config = MctsConfig {
         c_puct,
@@ -63,7 +66,15 @@ fn run_selfplay(
     let evaluator = load_evaluator(weights_path);
 
     let results = py.allow_threads(|| {
-        selfplay::generate_games(num_games, &config, evaluator.as_ref())
+        // Build a rayon pool with explicit thread count (0 = use all cores)
+        let threads = if num_threads > 0 { num_threads } else { num_cpus() };
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("failed to create thread pool");
+        pool.install(|| {
+            selfplay::generate_games(num_games, &config, evaluator.as_ref())
+        })
     });
 
     let all_positions: Vec<selfplay::TrainingPosition> = results
@@ -73,6 +84,12 @@ fn run_selfplay(
 
     let data = selfplay::serialize_positions(&all_positions);
     Ok(PyBytes::new_bound(py, &data).into())
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// Run self-play games using random evaluation (for testing).

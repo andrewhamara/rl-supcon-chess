@@ -320,6 +320,7 @@ def selfplay_batch(config, weights_path: Path, batch_size: int):
             dirichlet_alpha=config.engine.dirichlet_alpha,
             dirichlet_epsilon=config.engine.dirichlet_epsilon,
             temperature=config.engine.temperature,
+            num_threads=config.engine.num_threads,
         )
         return deserialize_positions(data)
     except ImportError:
@@ -391,7 +392,9 @@ def main():
                 export_weights(model, weights_path, fuse_batchnorm=True)
 
                 total_games = config.training.selfplay_games_per_cycle
-                sp_batch = max(1, min(8, total_games // 4))  # small batches for progress
+                # Each batch runs all games in parallel via rayon; split into
+                # a few batches so the dashboard can update between them.
+                sp_batch = max(1, total_games // 4)
                 games_done = 0
                 sp_t0 = time.time()
                 use_engine = not args.random_data

@@ -9,3 +9,4 @@ rand = "0.8"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 crossbeam-utils = "0.8"
+rayon = "1.10"
